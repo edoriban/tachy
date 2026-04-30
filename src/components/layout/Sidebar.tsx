@@ -84,7 +84,9 @@ export const Sidebar: FC<SidebarProps> = ({ drives, quickAccess, currentPath, on
                             ? 'active'
                             : ''
                             }`}
+                        style={{ paddingLeft: 8 }}
                     >
+                        <span className="w-4 shrink-0" aria-hidden="true" />
                         <span className="w-5 flex justify-center shrink-0 text-[var(--color-accent)]">
                             <HomeIcon />
                         </span>
@@ -123,8 +125,10 @@ export const Sidebar: FC<SidebarProps> = ({ drives, quickAccess, currentPath, on
                                 key={folder.path}
                                 onClick={() => onNavigate(folder.path)}
                                 className={`sidebar-item w-full relative ${isActive ? 'active' : ''}`}
+                                style={{ paddingLeft: 8 }}
                                 title={folder.path}
                             >
+                                <span className="w-4 shrink-0" aria-hidden="true" />
                                 <span className="w-5 flex justify-center shrink-0">
                                     {getQuickAccessIcon(folder.name, 18)}
                                 </span>
@@ -167,6 +171,7 @@ export const Sidebar: FC<SidebarProps> = ({ drives, quickAccess, currentPath, on
                 <button
                     onClick={() => setThisPCExpanded(!thisPCExpanded)}
                     className="sidebar-item w-full relative"
+                    style={{ paddingLeft: 8 }}
                 >
                     <span className={`w-4 flex justify-center shrink-0 text-[var(--color-text-muted)] transition-transform duration-150 ${thisPCExpanded ? 'rotate-90' : ''}`}>
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
