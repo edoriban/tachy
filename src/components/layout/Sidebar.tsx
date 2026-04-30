@@ -1,17 +1,27 @@
-// Enhanced Sidebar with Home, Cloud Drives, and Tree Navigation
-// Matches Windows 11 Explorer sidebar structure
+// Enhanced Sidebar with virtual Home + pinneable Quick Access + Cloud Drives + Tree Navigation.
+// Matches Windows 11 Explorer sidebar structure.
+//
+// Quick Access pins are now driven by `pinnedStore` (Zustand persist), so the
+// list reflects whatever the user has pinned via context menus. Right-clicking
+// a pin opens the same Tauri context menu that the file browser uses, with
+// the `is_pinned: true` flag set so it shows "Unpin from Quick access".
 
-import { FC, useEffect, useState } from 'react';
+import { FC, useEffect, useState, useMemo } from 'react';
 import type { FileEntry, DriveInfo } from '@types';
-import { fileService, type CloudDrive } from '@services';
+import { HOME_PATH } from '@types';
+import { fileService, systemService, type CloudDrive } from '@services';
+import { usePinnedStore } from '@store';
 import { DriveIcon, getQuickAccessIcon } from '@utils/icons';
 import { TreeItem } from './TreeItem';
 
 interface SidebarProps {
     drives: DriveInfo[];
-    quickAccess: FileEntry[];
     currentPath: string;
     onNavigate: (path: string) => void;
+    /** Surface a right-clicked pin upward so the parent's useContextMenu hook
+     *  can route the resulting "unpin" menu action back through the same flow
+     *  as folder-tree right-clicks. */
+    onPinContextMenu: (e: React.MouseEvent, file: FileEntry) => void;
 }
 
 // Icons
@@ -53,37 +63,81 @@ const ThisPCIcon: FC<{ size?: number }> = ({ size = 18 }) => (
     </svg>
 );
 
-export const Sidebar: FC<SidebarProps> = ({ drives, quickAccess, currentPath, onNavigate }) => {
+// Lucide-style "Pin" icon. Inlined to match the project's existing
+// inline-SVG icon pattern (no external icon library dep).
+const PinIndicatorIcon: FC<{ size?: number }> = ({ size = 12 }) => (
+    <svg
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+    >
+        <path d="M12 17v5" />
+        <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
+    </svg>
+);
+
+export const Sidebar: FC<SidebarProps> = ({ drives, currentPath, onNavigate, onPinContextMenu }) => {
     const [cloudDrives, setCloudDrives] = useState<CloudDrive[]>([]);
     const [thisPCExpanded, setThisPCExpanded] = useState(true);
+
+    const pinnedPaths = usePinnedStore((s) => s.pinnedPaths);
+    const [pinnedFiles, setPinnedFiles] = useState<FileEntry[]>([]);
 
     // Load cloud drives on mount
     useEffect(() => {
         fileService.getCloudDrives().then(setCloudDrives).catch(console.error);
     }, []);
 
+    // Resolve the persisted pin path list into FileEntry records (same metadata
+    // shape we use elsewhere, so the right-click context menu can carry the
+    // full file object back into useContextMenu).
+    useEffect(() => {
+        let cancelled = false;
+        if (pinnedPaths.length === 0) {
+            setPinnedFiles([]);
+            return;
+        }
+        // Sidebar rows don't render CloudBadge, so skip the cloud_status COM
+        // queries — keeps Home -> Sidebar refresh path snappy.
+        systemService
+            .getFoldersMetadata(pinnedPaths, { withCloudStatus: false })
+            .then((entries) => {
+                if (!cancelled) setPinnedFiles(entries);
+            })
+            .catch((err) => {
+                console.error('[Sidebar] getFoldersMetadata failed', err);
+                if (!cancelled) setPinnedFiles([]);
+            });
+        return () => { cancelled = true; };
+    }, [pinnedPaths]);
+
     // Separate OneDrive and iCloud
-    const oneDrives = cloudDrives.filter(c => c.provider.toLowerCase().includes('onedrive'));
-    const iCloudDrives = cloudDrives.filter(c => c.provider.toLowerCase().includes('icloud'));
+    const oneDrives = useMemo(
+        () => cloudDrives.filter(c => c.provider.toLowerCase().includes('onedrive')),
+        [cloudDrives]
+    );
+    const iCloudDrives = useMemo(
+        () => cloudDrives.filter(c => c.provider.toLowerCase().includes('icloud')),
+        [cloudDrives]
+    );
+
+    const homeActive = currentPath === HOME_PATH;
 
     return (
         <aside className="w-56 shrink-0 sidebar flex flex-col overflow-hidden">
             {/* Top Section: Home + OneDrive */}
             <div className="py-2 px-2">
                 <nav className="space-y-0.5">
-                    {/* Home */}
+                    {/* Home — virtual aggregator, never a real path */}
                     <button
-                        onClick={() => {
-                            const desktop = quickAccess.find(f => f.name === 'Desktop')?.path;
-                            if (desktop) {
-                                const home = desktop.replace('\\Desktop', '');
-                                onNavigate(home);
-                            }
-                        }}
-                        className={`sidebar-item w-full relative ${currentPath.toLowerCase() === (quickAccess.find(f => f.name === 'Desktop')?.path.replace('\\Desktop', '') ?? '').toLowerCase()
-                            ? 'active'
-                            : ''
-                            }`}
+                        onClick={() => onNavigate(HOME_PATH)}
+                        className={`sidebar-item w-full relative ${homeActive ? 'active' : ''}`}
                         style={{ paddingLeft: 8 }}
                     >
                         <span className="w-4 shrink-0" aria-hidden="true" />
@@ -115,29 +169,39 @@ export const Sidebar: FC<SidebarProps> = ({ drives, quickAccess, currentPath, on
             {/* Divider */}
             <div className="h-px bg-[var(--color-border)] mx-4 my-1 opacity-50" />
 
-            {/* Quick Access Libraries */}
-            <div className="py-1 px-2">
-                <nav className="space-y-0.5">
-                    {quickAccess.map((folder) => {
-                        const isActive = currentPath.toLowerCase() === folder.path.toLowerCase();
-                        return (
-                            <button
-                                key={folder.path}
-                                onClick={() => onNavigate(folder.path)}
-                                className={`sidebar-item w-full relative ${isActive ? 'active' : ''}`}
-                                style={{ paddingLeft: 8 }}
-                                title={folder.path}
-                            >
-                                <span className="w-4 shrink-0" aria-hidden="true" />
-                                <span className="w-5 flex justify-center shrink-0">
-                                    {getQuickAccessIcon(folder.name, 18)}
-                                </span>
-                                <span className="truncate font-medium">{folder.name}</span>
-                            </button>
-                        );
-                    })}
-                </nav>
-            </div>
+            {/* Quick Access — driven by pinnedStore. Empty state intentional:
+                if a user unpins everything, the section just disappears.        */}
+            {pinnedFiles.length > 0 && (
+                <div className="py-1 px-2">
+                    <nav className="space-y-0.5">
+                        {pinnedFiles.map((folder) => {
+                            const isActive = currentPath.toLowerCase() === folder.path.toLowerCase();
+                            return (
+                                <button
+                                    key={folder.path}
+                                    onClick={() => onNavigate(folder.path)}
+                                    onContextMenu={(e) => onPinContextMenu(e, folder)}
+                                    className={`sidebar-item w-full relative ${isActive ? 'active' : ''}`}
+                                    style={{ paddingLeft: 8 }}
+                                    title={folder.path}
+                                >
+                                    <span className="w-4 shrink-0" aria-hidden="true" />
+                                    <span className="w-5 flex justify-center shrink-0">
+                                        {getQuickAccessIcon(folder.name, 18)}
+                                    </span>
+                                    <span className="truncate font-medium">{folder.name}</span>
+                                    <span
+                                        className="ml-auto shrink-0 text-[var(--color-text-muted)]"
+                                        aria-hidden="true"
+                                    >
+                                        <PinIndicatorIcon size={12} />
+                                    </span>
+                                </button>
+                            );
+                        })}
+                    </nav>
+                </div>
+            )}
 
             {/* Divider */}
             <div className="h-px bg-[var(--color-border)] mx-4 my-1 opacity-50" />

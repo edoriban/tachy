@@ -3,6 +3,7 @@
 
 import { create } from 'zustand';
 import type { Tab, TabState, FileEntry } from '@types';
+import { HOME_PATH } from '@types';
 import { fileService } from '@services';
 
 // Generate unique tab ID
@@ -46,9 +47,13 @@ interface TabStore {
     initializeFirstTab: (path: string) => void;
 }
 
+// Friendly tab title, special-cased for the Home sentinel.
+const titleForPath = (path: string): string =>
+    path === HOME_PATH ? 'Home' : (path.split('\\').filter(Boolean).pop() || path);
+
 const createInitialTabState = (path: string): TabState => ({
     path,
-    title: path.split('\\').filter(Boolean).pop() || path,
+    title: titleForPath(path),
     history: [path],
     historyIndex: 0,
     selectedPaths: [],
@@ -71,7 +76,7 @@ export const useTabStore = create<TabStore>((set, get) => ({
     // Initialize first tab
     initializeFirstTab: (path: string) => {
         const id = generateId();
-        const title = path.split('\\').filter(Boolean).pop() || path;
+        const title = titleForPath(path);
 
         set({
             tabs: [{ id, path, title }],
@@ -88,7 +93,7 @@ export const useTabStore = create<TabStore>((set, get) => ({
     addTab: (path: string) => {
         const { tabs, files: currentFiles, tabStates, activeTabId } = get();
         const id = generateId();
-        const title = path.split('\\').filter(Boolean).pop() || path;
+        const title = titleForPath(path);
 
         // Clone files from current tab
         const currentTabFiles = currentFiles[activeTabId] || [];
@@ -159,7 +164,7 @@ export const useTabStore = create<TabStore>((set, get) => ({
     // Navigation
     navigateTo: (path, replaceHistory = false) => {
         const { activeTabId, tabs, tabStates } = get();
-        const title = path.split('\\').filter(Boolean).pop() || path;
+        const title = titleForPath(path);
         const current = tabStates[activeTabId];
 
         // Update tab
@@ -199,7 +204,7 @@ export const useTabStore = create<TabStore>((set, get) => ({
         if (current.historyIndex > 0) {
             const newIndex = current.historyIndex - 1;
             const path = current.history[newIndex];
-            const title = path.split('\\').filter(Boolean).pop() || path;
+            const title = titleForPath(path);
 
             set({
                 tabs: tabs.map((t) => (t.id === activeTabId ? { ...t, path, title } : t)),
@@ -217,7 +222,7 @@ export const useTabStore = create<TabStore>((set, get) => ({
         if (current.historyIndex < current.history.length - 1) {
             const newIndex = current.historyIndex + 1;
             const path = current.history[newIndex];
-            const title = path.split('\\').filter(Boolean).pop() || path;
+            const title = titleForPath(path);
 
             set({
                 tabs: tabs.map((t) => (t.id === activeTabId ? { ...t, path, title } : t)),
@@ -251,6 +256,19 @@ export const useTabStore = create<TabStore>((set, get) => ({
 
     // Loading
     loadDirectory: async (tabId, path) => {
+        // Virtual Home view doesn't read a real directory — it renders the
+        // pinned/recent aggregator. Clear files & loading state and bail.
+        if (path === HOME_PATH) {
+            get().setFiles(tabId, []);
+            get().updateTabState(tabId, {
+                selectedPaths: [],
+                lastSelectedPath: null,
+                isLoading: false,
+                error: null,
+            });
+            return;
+        }
+
         get().updateTabState(tabId, { isLoading: true, error: null });
 
         try {
@@ -271,6 +289,14 @@ export const useTabStore = create<TabStore>((set, get) => ({
         const currentState = get().getCurrentState();
 
         get().updateTabState(activeTabId, { searchQuery: query });
+
+        // Search is undefined on the virtual Home view — no real path to walk.
+        // We still record the query (so the input stays controlled) but skip
+        // the Tauri call entirely.
+        if (currentState.path === HOME_PATH) {
+            get().updateTabState(activeTabId, { isSearching: false, isLoading: false });
+            return;
+        }
 
         if (!query.trim()) {
             get().updateTabState(activeTabId, { isSearching: false });

@@ -33,3 +33,12 @@ export interface DriveInfo {
 export type ViewMode = 'grid' | 'list';
 export type SortBy = 'name' | 'date' | 'size' | 'type';
 export type SortOrder = 'asc' | 'desc';
+
+/**
+ * Sentinel path for the virtual Home aggregator view. When a tab's `path`
+ * equals this value the file browser renders `<HomeView />` instead of
+ * `<FileGrid />` / `<FileList />`. Chosen as a `tachy:` URI so it can never
+ * collide with a real Windows path.
+ */
+export const HOME_PATH = 'tachy:home' as const;
+export type HomePath = typeof HOME_PATH;

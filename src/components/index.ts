@@ -17,3 +17,4 @@ export { PreviewPanel } from './layout/PreviewPanel';
 export { FileGrid } from './file-browser/FileGrid';
 export { FileList } from './file-browser/FileList';
 export { FileItem } from './file-browser/FileItem';
+export { HomeView } from './file-browser/HomeView';

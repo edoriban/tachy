@@ -5,10 +5,16 @@ import { useState, useEffect } from 'react';
 import './App.css';
 
 // Stores
-import { useAppStore, useTabStore, useClipboardStore, useFolderPrefsStore } from '@store';
+import { useAppStore, useTabStore, useClipboardStore, useFolderPrefsStore, usePinnedStore } from '@store';
 
 // Hooks
 import { useFileOperations, useKeyboardShortcuts, useKeyboardNavigation, useContextMenu, type DialogType } from '@hooks';
+
+// Services
+import { systemService } from '@services';
+
+// Types
+import { HOME_PATH } from '@types';
 
 // Components - organized by category
 import {
@@ -17,6 +23,7 @@ import {
   Toolbar,
   FileGrid,
   FileList,
+  HomeView,
   PreviewPanel,
   InputDialog,
   ConfirmDialog,
@@ -31,7 +38,7 @@ function App() {
   const [showPreview, setShowPreview] = useState(false);
 
   // App store
-  const { drives, quickAccess, initialize } = useAppStore();
+  const { drives, initialize } = useAppStore();
 
   // Folder preferences store
   const { getPrefs, setViewMode: saveFolderViewMode } = useFolderPrefsStore();
@@ -105,17 +112,28 @@ function App() {
     const init = async () => {
       await initialize();
 
-      // Initialize first tab with user folder
-      const qa = useAppStore.getState().quickAccess;
-      if (qa.length > 0) {
-        const userPath = qa[0].path
-          .replace('\\Desktop', '')
-          .replace('\\Downloads', '')
-          .replace('\\Documents', '');
-        initializeFirstTab(userPath);
-      } else {
-        initializeFirstTab('C:\\');
+      // First-launch pin seed: if the persistent store has never been seeded,
+      // populate it with the Win32 known folders (Desktop, Downloads, etc.)
+      // resolved via SHGetKnownFolderPath. This recovers the previous
+      // hardcoded sidebar behavior while letting the user unpin any of them.
+      const { seeded, seedDefaults } = usePinnedStore.getState();
+      if (!seeded) {
+        try {
+          const known = await systemService.getKnownFolders();
+          const ordered = ['Desktop', 'Downloads', 'Documents', 'Pictures', 'Music', 'Videos']
+            .map((name) => known[name])
+            .filter((p): p is string => typeof p === 'string' && p.length > 0);
+          seedDefaults(ordered);
+        } catch (err) {
+          console.error('[App] failed to seed default pins', err);
+          // Mark seeded anyway to avoid hammering the command on every launch.
+          seedDefaults([]);
+        }
       }
+
+      // Open the virtual Home view as the initial tab. All actual locations
+      // (Desktop, drives, etc.) are reachable from the sidebar.
+      initializeFirstTab(HOME_PATH);
     };
     init();
   }, []);
@@ -165,9 +183,9 @@ function App() {
         {/* Sidebar */}
         <Sidebar
           drives={drives}
-          quickAccess={quickAccess}
           currentPath={currentState.path}
           onNavigate={navigateTo}
+          onPinContextMenu={handleContextMenu}
         />
 
         {/* Main content */}
@@ -205,8 +223,13 @@ function App() {
             </div>
           )}
 
-          {/* Files */}
-          {viewMode === 'grid' ? (
+          {/* Files (or virtual Home aggregator) */}
+          {currentState.path === HOME_PATH ? (
+            <HomeView
+              onOpen={handleOpen}
+              onContextMenu={handleContextMenu}
+            />
+          ) : viewMode === 'grid' ? (
             <FileGrid
               files={currentFiles}
               selectedPaths={currentState.selectedPaths}
@@ -232,7 +255,7 @@ function App() {
 
           {/* Status bar */}
           <footer className="h-6 flex items-center px-4 bg-[var(--color-bg-base)] border-t border-[var(--color-border)] text-[11px] text-[var(--color-text-muted)]">
-            <span>{currentFiles.length} items</span>
+            <span>{currentState.path === HOME_PATH ? 'Home' : `${currentFiles.length} items`}</span>
             {selectedFiles.length > 0 && (
               <>
                 <span className="mx-2">|</span>

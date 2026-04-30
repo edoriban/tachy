@@ -1,10 +1,11 @@
 // Hook for context menu handling
-// Manages native Tauri context menu integration
+// Manages native Tauri context menu integration. Now also handles pinning a
+// folder to / unpinning a folder from Quick Access.
 
 import { useEffect, useRef, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { systemService } from '@services';
-import { useTabStore, useClipboardStore } from '@store';
+import { useTabStore, useClipboardStore, usePinnedStore } from '@store';
 import { useFileOperations, type DialogType } from './useFileOperations';
 import type { FileEntry } from '@types';
 
@@ -23,6 +24,7 @@ export function useContextMenu({ setDialog }: ContextMenuOptions): ContextMenuRe
     const { handleOpen, handleCut, handleCopy, handlePaste } = useFileOperations();
     const { activeTabId, setSelectedPaths, getCurrentState } = useTabStore();
     const hasClipboard = useClipboardStore((s) => s.clipboard !== null);
+    const { addPin, removePin, isPinned } = usePinnedStore();
 
     // Handle right-click on file
     const handleContextMenu = useCallback(async (e: React.MouseEvent, file: FileEntry) => {
@@ -39,11 +41,13 @@ export function useContextMenu({ setDialog }: ContextMenuOptions): ContextMenuRe
                 filePath: file.path,
                 isFile: !file.is_dir,
                 hasClipboard,
+                isDir: file.is_dir,
+                isPinned: file.is_dir ? isPinned(file.path) : false,
             });
         } catch (error) {
             console.error('Failed to show context menu:', error);
         }
-    }, [activeTabId, setSelectedPaths, hasClipboard]);
+    }, [activeTabId, setSelectedPaths, hasClipboard, isPinned]);
 
     // Handle right-click on background
     const handleBackgroundContextMenu = useCallback(async (e: React.MouseEvent) => {
@@ -58,19 +62,25 @@ export function useContextMenu({ setDialog }: ContextMenuOptions): ContextMenuRe
                 filePath: null,
                 isFile: false,
                 hasClipboard,
+                isDir: false,
+                isPinned: false,
             });
         } catch (error) {
             console.error('Failed to show context menu:', error);
         }
     }, [hasClipboard]);
 
-    // Store handlers in ref to avoid recreating listener
+    // Store handlers in ref to avoid recreating listener on every render.
+    // The pin/unpin actions also live here so the Tauri menu callback can
+    // see the current store implementation.
     const handlersRef = useRef({
         handleOpen,
         handleCut,
         handleCopy,
         handlePaste,
         getCurrentState,
+        addPin,
+        removePin,
     });
 
     useEffect(() => {
@@ -80,8 +90,10 @@ export function useContextMenu({ setDialog }: ContextMenuOptions): ContextMenuRe
             handleCopy,
             handlePaste,
             getCurrentState,
+            addPin,
+            removePin,
         };
-    }, [handleOpen, handleCut, handleCopy, handlePaste, getCurrentState]);
+    }, [handleOpen, handleCut, handleCopy, handlePaste, getCurrentState, addPin, removePin]);
 
     // Listen for context menu actions from Tauri
     useEffect(() => {
@@ -126,6 +138,12 @@ export function useContextMenu({ setDialog }: ContextMenuOptions): ContextMenuRe
                     } catch (error) {
                         console.error('Failed to open terminal:', error);
                     }
+                    break;
+                case 'pin_quick_access':
+                    if (file && file.is_dir) handlers.addPin(file.path);
+                    break;
+                case 'unpin_quick_access':
+                    if (file) handlers.removePin(file.path);
                     break;
                 case 'properties':
                     if (file) {

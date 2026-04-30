@@ -5,9 +5,10 @@ use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Local};
 use image::ImageFormat;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Sync state for files managed by a Windows Cloud Files API provider
@@ -453,6 +454,348 @@ fn get_quick_access() -> Vec<FileEntry> {
     }
 
     folders
+}
+
+/// Build a `FileEntry` for a folder path. Returns `None` if the path does not exist
+/// or cannot be stat'd. Used by the pinned-folders / known-folders commands so the
+/// frontend gets consistent metadata (name, sync state, etc.) for sidebar pins.
+///
+/// When `with_cloud_status` is false, the (potentially expensive) Cloud Files
+/// API query is skipped — callers that don't render a CloudBadge (Home Quick
+/// access cards, Sidebar pin rows) should pass false to keep folder lookups
+/// snappy. The legacy placeholder fallback (file attribute bits) is still
+/// honored, so `is_cloud_placeholder` stays roughly correct.
+fn make_folder_entry(path: &Path, with_cloud_status: bool) -> Option<FileEntry> {
+    if !path.exists() {
+        return None;
+    }
+    let metadata = match path.metadata() {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+    if !metadata.is_dir() {
+        return None;
+    }
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+    let modified = format_system_time(metadata.modified());
+    let created = format_system_time(metadata.created());
+    let legacy_placeholder = is_cloud_placeholder(&metadata);
+    let (cloud_provider, sync_state) = if with_cloud_status {
+        get_cloud_status(path, &metadata)
+    } else {
+        (None, None)
+    };
+
+    Some(FileEntry {
+        name,
+        path: path.to_string_lossy().to_string(),
+        is_dir: true,
+        size: 0,
+        modified,
+        created,
+        extension: String::new(),
+        is_cloud_placeholder: cloud_placeholder_flag(legacy_placeholder, &sync_state),
+        cloud_provider,
+        sync_state,
+    })
+}
+
+/// Resolve a list of folder paths (typically from the frontend pinnedStore) into
+/// `FileEntry` records. Skips paths that no longer exist on disk so a deleted
+/// pin simply disappears from the UI rather than rendering a dead row.
+///
+/// `with_cloud_status` (default true) controls whether each entry runs the
+/// Cloud Files API query for sync badges. The Home view's Quick access cards
+/// and the sidebar pinned rows don't render CloudBadge, so they pass `false`
+/// to skip the COM round-trip per pin.
+#[tauri::command]
+fn get_folders_metadata(
+    paths: Vec<String>,
+    with_cloud_status: Option<bool>,
+) -> Vec<FileEntry> {
+    let with_cloud = with_cloud_status.unwrap_or(true);
+    paths
+        .into_iter()
+        .filter_map(|p| make_folder_entry(Path::new(&p), with_cloud))
+        .collect()
+}
+
+/// Resolve the canonical paths for the Win32 known folders we use as default
+/// Quick Access pins. Returns a `name -> absolute path` map; entries are skipped
+/// if the folder does not exist (covers users who relocated their Documents).
+///
+/// Uses `SHGetKnownFolderPath` on Windows for the canonical resolution; falls
+/// back to `%USERPROFILE%\<name>` joins on other platforms (mostly for tests).
+#[tauri::command]
+fn get_known_folders() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows::core::GUID;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::UI::Shell::{
+            SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads,
+            FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos, KNOWN_FOLDER_FLAG,
+        };
+
+        let entries: [(&str, GUID); 6] = [
+            ("Desktop", FOLDERID_Desktop),
+            ("Downloads", FOLDERID_Downloads),
+            ("Documents", FOLDERID_Documents),
+            ("Pictures", FOLDERID_Pictures),
+            ("Music", FOLDERID_Music),
+            ("Videos", FOLDERID_Videos),
+        ];
+
+        for (name, guid) in entries {
+            unsafe {
+                if let Ok(pwstr) =
+                    SHGetKnownFolderPath(&guid, KNOWN_FOLDER_FLAG(0), HANDLE::default())
+                {
+                    if !pwstr.is_null() {
+                        if let Ok(s) = pwstr.to_string() {
+                            if Path::new(&s).exists() {
+                                map.insert(name.to_string(), s);
+                            }
+                        }
+                        windows::Win32::System::Com::CoTaskMemFree(Some(
+                            pwstr.as_ptr() as *const _,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+            let home_path = Path::new(&home);
+            for name in &["Desktop", "Downloads", "Documents", "Pictures", "Music", "Videos"] {
+                let p = home_path.join(name);
+                if p.exists() {
+                    map.insert(name.to_string(), p.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    map
+}
+
+/// Resolve a Windows shortcut (.lnk) to its target absolute path using
+/// IShellLink + IPersistFile. Returns `None` if the link is broken, the target
+/// no longer exists, or this isn't a Windows build.
+#[cfg(target_os = "windows")]
+fn resolve_lnk_target(lnk_path: &Path) -> Option<PathBuf> {
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED, STGM_READ,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink, SLGP_RAWPATH};
+
+    unsafe {
+        // Idempotent — STA already initialized for thumbnail/share commands.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        let shell_link: IShellLinkW =
+            CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let persist: IPersistFile = shell_link.cast().ok()?;
+
+        // Encode .lnk path as null-terminated UTF-16.
+        let wide: Vec<u16> = lnk_path
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        persist.Load(PCWSTR::from_raw(wide.as_ptr()), STGM_READ).ok()?;
+
+        // Resolve target path. SLGP_RAWPATH avoids prompting for missing volumes.
+        let mut buf = vec![0u16; 1024];
+        let mut find_data = WIN32_FIND_DATAW::default();
+        shell_link
+            .GetPath(&mut buf, &mut find_data, SLGP_RAWPATH.0 as u32)
+            .ok()?;
+
+        // Strip the trailing null.
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        if len == 0 {
+            return None;
+        }
+        let target = String::from_utf16_lossy(&buf[..len]);
+        let target_path = PathBuf::from(target);
+        if target_path.exists() {
+            Some(target_path)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_lnk_target(_lnk_path: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// Read the Windows "Recent" items folder (FOLDERID_Recent), resolve each .lnk
+/// shortcut to its target file, and return up to `max` most recent targets.
+///
+/// Sort order is by the .lnk's own mtime (which is when Windows last touched
+/// the shortcut for that file — i.e. when it was last accessed/opened), not
+/// the target's mtime. Dead links are skipped.
+#[tauri::command]
+fn get_recent_files(max: Option<usize>) -> Result<Vec<FileEntry>, String> {
+    let limit = max.unwrap_or(30);
+
+    #[cfg(target_os = "windows")]
+    let recent_dir: PathBuf = {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Recent, KNOWN_FOLDER_FLAG};
+
+        unsafe {
+            let pwstr = SHGetKnownFolderPath(
+                &FOLDERID_Recent,
+                KNOWN_FOLDER_FLAG(0),
+                HANDLE::default(),
+            )
+            .map_err(|e| format!("SHGetKnownFolderPath(Recent) failed: {}", e))?;
+
+            if pwstr.is_null() {
+                return Err("Recent folder path is null".to_string());
+            }
+
+            let s = pwstr.to_string().map_err(|e| e.to_string())?;
+            windows::Win32::System::Com::CoTaskMemFree(Some(pwstr.as_ptr() as *const _));
+            PathBuf::from(s)
+        }
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let recent_dir: PathBuf = return Ok(Vec::new());
+
+    if !recent_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    // Collect (lnk_mtime, lnk_path) tuples first — cheap directory walk.
+    // The expensive step is the per-link COM round-trip in `resolve_lnk_target`,
+    // so we batch those into worker threads below.
+    let read_dir = match fs::read_dir(&recent_dir) {
+        Ok(r) => r,
+        Err(e) => return Err(format!("Failed to read Recent dir: {}", e)),
+    };
+
+    let mut lnk_inputs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in read_dir.flatten() {
+        let lnk_path = entry.path();
+        let ext = lnk_path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if ext != "lnk" {
+            continue;
+        }
+        let lnk_meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime = lnk_meta
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        lnk_inputs.push((mtime, lnk_path));
+    }
+
+    // Resolve .lnk targets in parallel. Each worker thread initializes its
+    // own COM apartment via `resolve_lnk_target`'s internal `CoInitializeEx`,
+    // which is the supported pattern (IPersistFile works in any apartment).
+    // We cap thread count to avoid spawning hundreds for huge Recent folders.
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> =
+        Vec::with_capacity(lnk_inputs.len());
+    if !lnk_inputs.is_empty() {
+        let worker_count = std::cmp::min(lnk_inputs.len(), 8);
+        let chunk_size = (lnk_inputs.len() + worker_count - 1) / worker_count;
+        let chunks: Vec<Vec<(std::time::SystemTime, PathBuf)>> = lnk_inputs
+            .chunks(chunk_size)
+            .map(|c| c.to_vec())
+            .collect();
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| {
+                    s.spawn(move || {
+                        let mut out: Vec<(std::time::SystemTime, PathBuf)> =
+                            Vec::with_capacity(chunk.len());
+                        for (mtime, lnk_path) in chunk {
+                            if let Some(target) = resolve_lnk_target(&lnk_path) {
+                                out.push((mtime, target));
+                            }
+                        }
+                        out
+                    })
+                })
+                .collect();
+            for h in handles {
+                if let Ok(mut part) = h.join() {
+                    candidates.append(&mut part);
+                }
+            }
+        });
+    }
+
+    // Most recent first. Stable enough — duplicates (same file, multiple .lnks)
+    // are de-duped after sort by tracking seen target paths.
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<FileEntry> = Vec::with_capacity(limit);
+    for (_, target) in candidates {
+        if out.len() >= limit {
+            break;
+        }
+        let key = target.to_string_lossy().to_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        let metadata = match target.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let modified = format_system_time(metadata.modified());
+        let created = format_system_time(metadata.created());
+        let extension = target
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let legacy_placeholder = is_cloud_placeholder(&metadata);
+        let (cloud_provider, sync_state) = get_cloud_status(&target, &metadata);
+        out.push(FileEntry {
+            name: target
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            path: target.to_string_lossy().to_string(),
+            is_dir: metadata.is_dir(),
+            size: metadata.len(),
+            modified,
+            created,
+            extension,
+            is_cloud_placeholder: cloud_placeholder_flag(legacy_placeholder, &sync_state),
+            cloud_provider,
+            sync_state,
+        });
+    }
+
+    Ok(out)
 }
 
 /// Represents a cloud drive
@@ -1166,6 +1509,12 @@ mod share_impl {
 }
 
 // Native context menu using tauri::menu
+//
+// `is_file` is true when the right-clicked item is a non-directory file.
+// `is_dir`  is true when it's a directory — used to gate the "Pin to Quick
+// access" entry.
+// `is_pinned` indicates the item is already in the user's Quick Access pins;
+// the menu then shows "Unpin from Quick access" instead of the pin entry.
 #[tauri::command]
 async fn show_context_menu(
     app: tauri::AppHandle,
@@ -1175,8 +1524,13 @@ async fn show_context_menu(
     file_path: Option<String>,
     is_file: bool,
     has_clipboard: bool,
+    is_dir: Option<bool>,
+    is_pinned: Option<bool>,
 ) -> Result<(), String> {
     use tauri::menu::{ContextMenu, MenuBuilder, MenuItemBuilder};
+
+    let is_dir = is_dir.unwrap_or(false);
+    let is_pinned = is_pinned.unwrap_or(false);
 
     let mut menu_builder = MenuBuilder::new(&app);
 
@@ -1241,6 +1595,24 @@ async fn show_context_menu(
                 .build(&app)
                 .map_err(|e| e.to_string())?,
         );
+
+    // Pin / unpin to Quick access — only for directories.
+    if file_path.is_some() && is_dir {
+        menu_builder = menu_builder.separator();
+        if is_pinned {
+            menu_builder = menu_builder.item(
+                &MenuItemBuilder::with_id("unpin_quick_access", "Unpin from Quick access")
+                    .build(&app)
+                    .map_err(|e| e.to_string())?,
+            );
+        } else {
+            menu_builder = menu_builder.item(
+                &MenuItemBuilder::with_id("pin_quick_access", "Pin to Quick access")
+                    .build(&app)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+    }
 
     // Properties only for files
     if file_path.is_some() {
@@ -1583,6 +1955,9 @@ fn main() {
             search_files,
             get_parent_directory,
             get_quick_access,
+            get_folders_metadata,
+            get_known_folders,
+            get_recent_files,
             get_cloud_drives,
             get_folder_children,
             create_folder,

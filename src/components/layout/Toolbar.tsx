@@ -1,5 +1,6 @@
 import { FC, useState, useEffect, useRef } from 'react';
 import type { ViewMode } from '@types';
+import { HOME_PATH } from '@types';
 import {
     ChevronLeftIcon,
     ChevronRightIcon,
@@ -118,7 +119,9 @@ export const Toolbar: FC<ToolbarProps> = ({
 
     useEffect(() => {
         if (!isEditing) {
-            setPathInput(currentPath);
+            // Keep the sentinel out of the editable input — show empty so the
+            // user types a real path to leave Home.
+            setPathInput(currentPath === HOME_PATH ? '' : currentPath);
         }
     }, [currentPath, isEditing]);
 
@@ -138,8 +141,10 @@ export const Toolbar: FC<ToolbarProps> = ({
         }
     };
 
-    // Parse breadcrumbs
-    const breadcrumbs = currentPath.split('\\').filter(Boolean);
+    // Parse breadcrumbs. The virtual Home path is rendered as a single
+    // "Home" pill rather than its sentinel string.
+    const isHome = currentPath === HOME_PATH;
+    const breadcrumbs = isHome ? ['Home'] : currentPath.split('\\').filter(Boolean);
 
     return (
         <div className="flex flex-col">
@@ -193,6 +198,10 @@ export const Toolbar: FC<ToolbarProps> = ({
                                         <button
                                             onClick={(e) => {
                                                 e.stopPropagation();
+                                                if (isHome) {
+                                                    onNavigate(HOME_PATH);
+                                                    return;
+                                                }
                                                 const path = breadcrumbs.slice(0, index + 1).join('\\') + '\\';
                                                 onNavigate(path);
                                             }}

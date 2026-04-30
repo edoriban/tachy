@@ -6,6 +6,7 @@ import { useCallback } from 'react';
 import { fileService, systemService } from '@services';
 import { useTabStore, useClipboardStore } from '@store';
 import type { FileEntry } from '@types';
+import { HOME_PATH } from '@types';
 
 export type DialogType = 'newFolder' | 'rename' | 'delete' | 'properties' | null;
 
@@ -170,6 +171,8 @@ export function useFileOperations(): FileOperationsReturn {
 
     const goUp = useCallback(async () => {
         const currentState = useTabStore.getState().getCurrentState();
+        // Home has no parent — bail before hitting Tauri.
+        if (currentState.path === HOME_PATH) return;
         try {
             const parent = await systemService.getParentDirectory(currentState.path);
             if (parent && parent !== currentState.path) {
