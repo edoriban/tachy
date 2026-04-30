@@ -97,8 +97,14 @@ export const PreviewPanel: FC<PreviewPanelProps> = ({ file, isVisible, onClose }
         }
     };
 
-    const handleShare = () => {
-        setActionMessage('Sharing is coming soon.');
+    const handleShare = async () => {
+        if (!file) return;
+        try {
+            await invoke('share_file_native', { path: file.path });
+        } catch (err) {
+            console.error('Failed to open share dialog:', err);
+            setActionMessage(`Could not open share dialog: ${String(err)}`);
+        }
     };
 
     // Load preview when file changes
@@ -283,14 +289,14 @@ export const PreviewPanel: FC<PreviewPanelProps> = ({ file, isVisible, onClose }
                     {/* Separator */}
                     <div className="mx-5 border-t border-[var(--color-border)]" />
 
-                    {/* Action buttons (Share / Properties) — Share only for cloud items. */}
+                    {/* Action buttons (Share / Properties) — Share for any file (Windows share dialog handles all files); hidden for folders since verb "share" doesn't apply to directories. */}
                     <div className="px-5 py-4 flex items-center gap-2">
-                        {file.cloud_provider && (
+                        {!file.is_dir && (
                             <button
                                 type="button"
                                 onClick={handleShare}
                                 className="flex-1 h-8 flex items-center justify-center gap-1.5 rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-bg-base)] text-[12px] text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-text-primary)] transition-colors"
-                                title="Share (coming soon)"
+                                title="Open Windows share dialog"
                             >
                                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                                     <circle cx="18" cy="5" r="3" />

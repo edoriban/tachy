@@ -956,6 +956,215 @@ fn show_native_properties(path: String) -> Result<(), String> {
     Ok(())
 }
 
+// Show native Windows share dialog (the modern Win11 share UI) using
+// IDataTransferManagerInterop + WinRT DataTransferManager.
+//
+// The previous Win32 ShellExecuteExW("share") implementation invoked the
+// LEGACY network-sharing verb, which fails with "no app associated" for most
+// files (PDFs, ZIPs, etc.). The modern share UI (with My Phone, Discord,
+// Teams, Nearby Sharing) requires the WinRT path.
+//
+// Implementation notes:
+// - WinRT requires STA. Tauri command handlers run on tokio workers (MTA),
+//   so we must dispatch to the main UI thread via app_handle.run_on_main_thread.
+// - StorageFile::GetFileFromPathAsync is async; inside DataRequested we must
+//   take a deferral, .get() the file synchronously, populate the package, and
+//   complete the deferral.
+// - SetStorageItems takes IIterable<IStorageItem>. windows-rs 0.58 does not
+//   expose a public Vector<T> ctor, so we implement IIterable+IIterator
+//   ourselves with #[implement] (see SingleItemIterable below).
+#[tauri::command]
+fn share_file_native(
+    app_handle: tauri::AppHandle,
+    window: tauri::Window,
+    path: String,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        // Capture the raw HWND value here (on the calling thread). HWND values
+        // are thread-agnostic; we use isize to send across threads (HWND
+        // contains a raw pointer which is !Send).
+        let hwnd_raw: isize = match window.hwnd() {
+            Ok(h) => h.0 as isize,
+            Err(e) => return Err(format!("Failed to get HWND: {}", e)),
+        };
+
+        println!("[Share] Opening WinRT share dialog for: {}", path);
+
+        let path_for_main = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+        // Dispatch the WinRT calls onto the main thread (STA).
+        let dispatch_result = app_handle.run_on_main_thread(move || {
+            let result = share_impl::show_share_ui(hwnd_raw, path_for_main);
+            let _ = tx.send(result);
+        });
+
+        if let Err(e) = dispatch_result {
+            return Err(format!("Failed to dispatch to main thread: {}", e));
+        }
+
+        // ShowShareUIForWindow returns immediately after queuing the dialog;
+        // recv should be quick. We block here so the Tauri command returns
+        // a meaningful Result to the frontend.
+        match rx.recv() {
+            Ok(r) => r,
+            Err(e) => Err(format!("Main-thread channel closed unexpectedly: {}", e)),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app_handle, window, path);
+        Err("Native share dialog is only supported on Windows".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod share_impl {
+    use windows::core::{implement, Interface, HSTRING};
+    use windows::ApplicationModel::DataTransfer::{
+        DataRequestedEventArgs, DataTransferManager,
+    };
+    use windows::Foundation::Collections::{
+        IIterable, IIterable_Impl, IIterator, IIterator_Impl,
+    };
+    use windows::Foundation::TypedEventHandler;
+    use windows::Storage::{IStorageItem, StorageFile};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::IDataTransferManagerInterop;
+
+    use std::cell::Cell;
+
+    /// Minimal IIterable<IStorageItem> backed by exactly one item.
+    /// Implemented manually because windows-rs 0.58 has no public Vector<T> ctor.
+    #[implement(IIterable<IStorageItem>)]
+    struct SingleItemIterable {
+        item: IStorageItem,
+    }
+
+    impl IIterable_Impl<IStorageItem> for SingleItemIterable_Impl {
+        fn First(&self) -> windows::core::Result<IIterator<IStorageItem>> {
+            let iter = SingleItemIterator {
+                item: self.item.clone(),
+                consumed: Cell::new(false),
+            };
+            Ok(iter.into())
+        }
+    }
+
+    #[implement(IIterator<IStorageItem>)]
+    struct SingleItemIterator {
+        item: IStorageItem,
+        consumed: Cell<bool>,
+    }
+
+    impl IIterator_Impl<IStorageItem> for SingleItemIterator_Impl {
+        fn Current(&self) -> windows::core::Result<IStorageItem> {
+            if self.consumed.get() {
+                Err(windows::core::Error::new(
+                    windows::core::HRESULT(0x8000000Bu32 as i32), // E_BOUNDS
+                    "iterator exhausted",
+                ))
+            } else {
+                Ok(self.item.clone())
+            }
+        }
+
+        fn HasCurrent(&self) -> windows::core::Result<bool> {
+            Ok(!self.consumed.get())
+        }
+
+        fn MoveNext(&self) -> windows::core::Result<bool> {
+            self.consumed.set(true);
+            Ok(false)
+        }
+
+        fn GetMany(
+            &self,
+            items: &mut [<IStorageItem as windows::core::Type<IStorageItem>>::Default],
+        ) -> windows::core::Result<u32> {
+            if self.consumed.get() || items.is_empty() {
+                return Ok(0);
+            }
+            items[0] = Some(self.item.clone());
+            self.consumed.set(true);
+            Ok(1)
+        }
+    }
+
+    pub fn show_share_ui(hwnd_raw: isize, path: String) -> Result<(), String> {
+        let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
+
+        // Defensive: ensure STA on this thread. Idempotent — returns S_FALSE if
+        // already STA. RPC_E_CHANGED_MODE means a different apartment was set
+        // earlier; that's typically fine for the main UI thread (already STA).
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+
+        let interop: IDataTransferManagerInterop =
+            windows::core::factory::<DataTransferManager, IDataTransferManagerInterop>()
+                .map_err(|e| format!("Failed to get IDataTransferManagerInterop: {}", e))?;
+
+        let dtm: DataTransferManager = unsafe {
+            interop
+                .GetForWindow(hwnd)
+                .map_err(|e| format!("GetForWindow failed: {}", e))?
+        };
+
+        let path_for_handler = path.clone();
+        let handler = TypedEventHandler::<DataTransferManager, DataRequestedEventArgs>::new(
+            move |_sender, args| -> windows::core::Result<()> {
+                let args = args.as_ref().ok_or_else(|| {
+                    windows::core::Error::new(
+                        windows::core::HRESULT(0x80004003u32 as i32), // E_POINTER
+                        "DataRequested args were null",
+                    )
+                })?;
+                let request = args.Request()?;
+                let deferral = request.GetDeferral()?;
+
+                // Always complete the deferral, even on error inside the body.
+                let body = || -> windows::core::Result<()> {
+                    let data = request.Data()?;
+                    let props = data.Properties()?;
+                    props.SetTitle(&HSTRING::from("Share"))?;
+
+                    let path_h = HSTRING::from(path_for_handler.as_str());
+                    let file: StorageFile =
+                        StorageFile::GetFileFromPathAsync(&path_h)?.get()?;
+                    let item: IStorageItem = file.cast()?;
+
+                    let iterable: IIterable<IStorageItem> =
+                        SingleItemIterable { item }.into();
+                    data.SetStorageItems(&iterable, true)?;
+                    Ok(())
+                };
+
+                let result = body();
+                let _ = deferral.Complete();
+                if let Err(e) = &result {
+                    eprintln!("[Share] DataRequested handler error: {}", e);
+                }
+                result
+            },
+        );
+
+        let _token = dtm
+            .DataRequested(&handler)
+            .map_err(|e| format!("DataRequested registration failed: {}", e))?;
+
+        unsafe {
+            interop
+                .ShowShareUIForWindow(hwnd)
+                .map_err(|e| format!("ShowShareUIForWindow failed: {}", e))?;
+        }
+
+        Ok(())
+    }
+}
+
 // Native context menu using tauri::menu
 #[tauri::command]
 async fn show_context_menu(
@@ -1388,6 +1597,7 @@ fn main() {
             close_window,
             is_maximized,
             show_native_properties,
+            share_file_native,
             show_context_menu,
             get_thumbnail,
             read_file_preview

@@ -18,7 +18,7 @@ serde_json = "1"
 walkdir = "2"
 chrono = "0.4"
 
-# Thumbnail generation + Cloud Files API (sync status)
+# Thumbnail generation + Cloud Files API (sync status) + WinRT share dialog
 windows = { version = "0.58", features = [
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
@@ -28,7 +28,16 @@ windows = { version = "0.58", features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_Graphics_Gdi",
     "Win32_System_Ole",
-    "Win32_System_Variant"
+    "Win32_System_Variant",
+    "Foundation",
+    "Foundation_Collections",
+    "ApplicationModel_DataTransfer",
+    "Storage",
+    "implement"
 ] }
+# windows-core is already a transitive dep of `windows`; expose it as a
+# direct dep so the #[implement] macro's generated `::windows_core::...`
+# paths resolve. Same version as `windows` to avoid duplication.
+windows-core = "0.58"
 image = "0.25"
 base64 = "0.22"
