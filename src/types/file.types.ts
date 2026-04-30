@@ -1,14 +1,26 @@
 // Types for file entries and system information
 // Matches the Rust structs in src-tauri
 
+/**
+ * High-level cloud sync state, mirroring the Rust enum
+ * (`#[serde(rename_all = "kebab-case")]`).
+ */
+export type CloudSyncState = 'synced' | 'syncing' | 'online-only' | 'error';
+
 export interface FileEntry {
     name: string;
     path: string;
     is_dir: boolean;
     size: number;
     modified: string;
+    created: string;
     extension: string;
-    is_cloud_placeholder: boolean; // Cloud file not yet downloaded
+    /** Legacy flag — kept in sync with `sync_state === 'online-only'` when known. */
+    is_cloud_placeholder: boolean;
+    /** Storage provider id (e.g. "OneDrive!Personal", "iCloud!", "GoogleDriveFS!") when applicable. */
+    cloud_provider?: string | null;
+    /** Sync state from the Windows Cloud Files API; absent for non-cloud items. */
+    sync_state?: CloudSyncState | null;
 }
 
 export interface DriveInfo {

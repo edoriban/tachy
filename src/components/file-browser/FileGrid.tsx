@@ -5,6 +5,7 @@
 import { FC } from 'react';
 import type { FileEntry } from '@types';
 import { Thumbnail } from './Thumbnail';
+import { CloudBadge } from './CloudBadge';
 
 interface FileGridProps {
     files: FileEntry[];
@@ -46,13 +47,18 @@ export const FileGrid: FC<FileGridProps> = ({ files, selectedPaths, onSelect, on
                                 }`}
                         >
                             {/* Thumbnail or Icon */}
-                            <div className="w-14 h-14 flex items-center justify-center mb-2">
+                            <div className="relative w-14 h-14 flex items-center justify-center mb-2">
                                 <Thumbnail
                                     path={file.path}
                                     extension={file.extension}
                                     isDir={file.is_dir}
                                     size={56}
                                 />
+                                {file.sync_state && (
+                                    <span className="pointer-events-none absolute bottom-0 right-0">
+                                        <CloudBadge syncState={file.sync_state} size={14} />
+                                    </span>
+                                )}
                             </div>
                             <span
                                 className={`text-[12px] text-center w-full px-1 leading-snug ${isSelected ? 'text-[var(--color-accent)]' : 'text-[var(--color-text-secondary)]'

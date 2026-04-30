@@ -3,9 +3,50 @@
 
 import { FC, useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import type { FileEntry } from '@types';
+import type { FileEntry, CloudSyncState } from '@types';
 import { formatSize, getFileType } from '@utils/format';
 import { Thumbnail } from '../file-browser/Thumbnail';
+import { CloudBadge } from '../file-browser/CloudBadge';
+
+// Extract parent directory from a Windows-style absolute path.
+// Example: "C:\\Users\\Edgar\\Pictures\\photo.jpg" -> "C:\\Users\\Edgar\\Pictures"
+const getParentPath = (fullPath: string): string => {
+    if (!fullPath) return '';
+    // Handle both backslash and forward slash; normalize to backslash for display.
+    const normalized = fullPath.replace(/\//g, '\\');
+    const lastSlash = normalized.lastIndexOf('\\');
+    if (lastSlash <= 2) {
+        // Path is at drive root (e.g., "C:\\file") — parent is the drive itself.
+        return normalized.slice(0, Math.max(lastSlash + 1, 3));
+    }
+    return normalized.slice(0, lastSlash);
+};
+
+// Availability label derived from the Windows Cloud Files API state.
+const getAvailabilityLabel = (state: CloudSyncState): string => {
+    switch (state) {
+        case 'synced':
+            return 'Available on this device';
+        case 'syncing':
+            return 'Syncing…';
+        case 'online-only':
+            return 'Online only';
+        case 'error':
+            return 'Sync error';
+    }
+};
+
+// Pretty-print the provider id Windows reports (e.g. "OneDrive!Personal").
+const formatProvider = (provider: string): string => {
+    // Provider ids look like "OneDrive!Personal" or "GoogleDriveFS!".
+    const head = provider.split('!')[0]?.trim();
+    if (!head) return provider;
+    if (/^onedrive$/i.test(head)) return 'OneDrive';
+    if (/^googledrive(fs)?$/i.test(head)) return 'Google Drive';
+    if (/^icloud/i.test(head)) return 'iCloud';
+    if (/^dropbox/i.test(head)) return 'Dropbox';
+    return head;
+};
 
 interface PreviewPanelProps {
     file: FileEntry | null;
@@ -37,6 +78,28 @@ export const PreviewPanel: FC<PreviewPanelProps> = ({ file, isVisible, onClose }
     const [previewData, setPreviewData] = useState<FilePreviewData | null>(null);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [actionMessage, setActionMessage] = useState<string | null>(null);
+
+    // Auto-clear inline action messages after a moment.
+    useEffect(() => {
+        if (!actionMessage) return;
+        const t = setTimeout(() => setActionMessage(null), 2400);
+        return () => clearTimeout(t);
+    }, [actionMessage]);
+
+    const handleOpenProperties = async () => {
+        if (!file) return;
+        try {
+            await invoke('show_native_properties', { path: file.path });
+        } catch (err) {
+            console.error('Failed to open properties dialog:', err);
+            setActionMessage(`Could not open properties: ${String(err)}`);
+        }
+    };
+
+    const handleShare = () => {
+        setActionMessage('Sharing is coming soon.');
+    };
 
     // Load preview when file changes
     useEffect(() => {
@@ -143,6 +206,12 @@ export const PreviewPanel: FC<PreviewPanelProps> = ({ file, isVisible, onClose }
                                         {getFileType(file.extension, file.is_dir)}
                                     </td>
                                 </tr>
+                                <tr>
+                                    <td className="text-[var(--color-text-muted)] align-middle whitespace-nowrap pr-3">File location</td>
+                                    <td className="text-[var(--color-text-secondary)] text-right align-middle truncate max-w-0" title={getParentPath(file.path)}>
+                                        {getParentPath(file.path) || '-'}
+                                    </td>
+                                </tr>
                                 {!file.is_dir && (
                                     <tr>
                                         <td className="text-[var(--color-text-muted)] align-middle">Size</td>
@@ -152,9 +221,15 @@ export const PreviewPanel: FC<PreviewPanelProps> = ({ file, isVisible, onClose }
                                     </tr>
                                 )}
                                 <tr>
-                                    <td className="text-[var(--color-text-muted)] align-middle">Modified</td>
+                                    <td className="text-[var(--color-text-muted)] align-middle whitespace-nowrap pr-3">Date modified</td>
                                     <td className="text-[var(--color-text-secondary)] text-right align-middle">
                                         {file.modified || '-'}
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td className="text-[var(--color-text-muted)] align-middle whitespace-nowrap pr-3">Date created</td>
+                                    <td className="text-[var(--color-text-secondary)] text-right align-middle">
+                                        {file.created || '-'}
                                     </td>
                                 </tr>
                                 {previewData?.lineCount && (
@@ -168,6 +243,86 @@ export const PreviewPanel: FC<PreviewPanelProps> = ({ file, isVisible, onClose }
                             </tbody>
                         </table>
                     </div>
+
+                    {/* Availability status — only for items in a cloud-provider namespace. */}
+                    {file.cloud_provider && (
+                        <>
+                            <div className="mx-5 border-t border-[var(--color-border)]" />
+                            <div className="px-5 py-4">
+                                <div className="text-[11px] text-[var(--color-text-muted)] mb-2 font-medium uppercase tracking-wide">
+                                    Availability status
+                                </div>
+                                <div className="flex items-center gap-2 text-[12px] text-[var(--color-text-secondary)]">
+                                    <CloudBadge syncState={file.sync_state} size={14} />
+                                    <span>
+                                        {file.sync_state
+                                            ? getAvailabilityLabel(file.sync_state)
+                                            : 'Status unavailable'}
+                                    </span>
+                                </div>
+                                <div className="text-[11px] text-[var(--color-text-muted)] mt-1 ml-[22px]">
+                                    via {formatProvider(file.cloud_provider)}
+                                </div>
+                            </div>
+                        </>
+                    )}
+
+                    {/* Separator */}
+                    <div className="mx-5 border-t border-[var(--color-border)]" />
+
+                    {/* Recent Activity (placeholder) */}
+                    <div className="px-5 py-4">
+                        <div className="text-[11px] text-[var(--color-text-muted)] mb-2 font-medium uppercase tracking-wide">
+                            Recent Activity
+                        </div>
+                        <div className="text-[12px] text-[var(--color-text-muted)] italic">
+                            No recent activity for this item.
+                        </div>
+                    </div>
+
+                    {/* Separator */}
+                    <div className="mx-5 border-t border-[var(--color-border)]" />
+
+                    {/* Action buttons (Share / Properties) — Share only for cloud items. */}
+                    <div className="px-5 py-4 flex items-center gap-2">
+                        {file.cloud_provider && (
+                            <button
+                                type="button"
+                                onClick={handleShare}
+                                className="flex-1 h-8 flex items-center justify-center gap-1.5 rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-bg-base)] text-[12px] text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-text-primary)] transition-colors"
+                                title="Share (coming soon)"
+                            >
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                                    <circle cx="18" cy="5" r="3" />
+                                    <circle cx="6" cy="12" r="3" />
+                                    <circle cx="18" cy="19" r="3" />
+                                    <line x1="8.6" y1="13.5" x2="15.4" y2="17.5" />
+                                    <line x1="15.4" y1="6.5" x2="8.6" y2="10.5" />
+                                </svg>
+                                Share
+                            </button>
+                        )}
+                        <button
+                            type="button"
+                            onClick={handleOpenProperties}
+                            className="flex-1 h-8 flex items-center justify-center gap-1.5 rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-bg-base)] text-[12px] text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-text-primary)] transition-colors"
+                            title="Open Windows properties dialog"
+                        >
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                                <circle cx="12" cy="12" r="3" />
+                                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                            </svg>
+                            Properties
+                        </button>
+                    </div>
+
+                    {actionMessage && (
+                        <div className="px-5 -mt-2 pb-3">
+                            <div className="rounded-[var(--radius-md)] bg-[var(--color-bg-base)] border border-[var(--color-border)] px-3 py-2 text-[11px] text-[var(--color-text-secondary)]">
+                                {actionMessage}
+                            </div>
+                        </div>
+                    )}
 
                     {/* Text Preview */}
                     {isText && (

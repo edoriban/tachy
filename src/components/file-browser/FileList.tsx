@@ -3,6 +3,7 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import type { FileEntry, SortBy, SortOrder } from '@types';
 import { getFileIcon } from '@utils/icons';
 import { formatSize, getFileType } from '@utils/format';
+import { CloudBadge } from './CloudBadge';
 
 interface FileListProps {
     files: FileEntry[];
@@ -72,8 +73,13 @@ const FileRow: FC<{
     >
         {/* Name with icon */}
         <div className="flex items-center gap-3 min-w-0 pl-1">
-            <div className="flex-shrink-0 w-5 h-5 flex items-center justify-center">
+            <div className="relative flex-shrink-0 w-5 h-5 flex items-center justify-center">
                 {getFileIcon(file.extension, file.is_dir, 20)}
+                {file.sync_state && (
+                    <span className="pointer-events-none absolute -bottom-0.5 -right-0.5">
+                        <CloudBadge syncState={file.sync_state} size={11} />
+                    </span>
+                )}
             </div>
             <span
                 className={`truncate text-[13px] ${isSelected ? 'text-[var(--color-accent)]' : ''}`}

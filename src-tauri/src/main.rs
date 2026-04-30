@@ -10,6 +10,21 @@ use std::io::Cursor;
 use std::path::Path;
 use walkdir::WalkDir;
 
+/// Sync state for files managed by a Windows Cloud Files API provider
+/// (OneDrive, iCloud Drive, Google Drive Stream, Dropbox, etc.)
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CloudSyncState {
+    /// File is fully hydrated and locally available.
+    Synced,
+    /// File is currently syncing/hydrating (download or upload in progress).
+    Syncing,
+    /// File is a placeholder; data lives in the cloud.
+    OnlineOnly,
+    /// Sync error reported by the provider.
+    Error,
+}
+
 /// Represents a file or directory entry
 #[derive(Serialize, Clone)]
 pub struct FileEntry {
@@ -18,8 +33,23 @@ pub struct FileEntry {
     pub is_dir: bool,
     pub size: u64,
     pub modified: String,
+    pub created: String,
     pub extension: String,
-    pub is_cloud_placeholder: bool, // Cloud file not yet downloaded
+    pub is_cloud_placeholder: bool, // legacy: derived from sync_state == OnlineOnly when present
+    /// Storage provider id when known (e.g. "OneDrive!Personal", "iCloud!", "GoogleDriveFS!").
+    /// `None` for regular local files outside any cloud namespace.
+    pub cloud_provider: Option<String>,
+    /// High-level sync state from the Cloud Files API. `None` for non-cloud items.
+    pub sync_state: Option<CloudSyncState>,
+}
+
+/// Format a SystemTime into a "YYYY-MM-DD HH:MM" local string, or "-" on error
+fn format_system_time(time: std::io::Result<std::time::SystemTime>) -> String {
+    time.map(|t| {
+        let datetime: DateTime<Local> = t.into();
+        datetime.format("%Y-%m-%d %H:%M").to_string()
+    })
+    .unwrap_or_else(|_| String::from("-"))
 }
 
 /// Represents a drive on the system
@@ -45,6 +75,192 @@ fn is_cloud_placeholder(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
+/// Quick path-prefix check: skip COM querying for paths that obviously aren't
+/// inside any cloud-provider namespace. Falls back to attribute-based heuristic
+/// (FILE_ATTRIBUTE_RECALL_*) when we don't recognize the prefix.
+#[cfg(target_os = "windows")]
+fn looks_like_cloud_root(path: &Path) -> bool {
+    let path_str = path.to_string_lossy().to_lowercase();
+    // Common provider folder names we see under %USERPROFILE% (or other roots).
+    [
+        "\\onedrive",
+        "\\onedrive - ",
+        "\\icloud",
+        "\\icloudphotos",
+        "\\google drive",
+        "\\googledrive",
+        "\\my drive",
+        "\\dropbox",
+        "\\box",
+    ]
+    .iter()
+    .any(|needle| path_str.contains(needle))
+}
+
+#[cfg(target_os = "windows")]
+fn metadata_has_cloud_attrs(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    // RECALL_ON_DATA_ACCESS | RECALL_ON_OPEN
+    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x00400000;
+    const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x00040000;
+    const FILE_ATTRIBUTE_PINNED: u32 = 0x00080000;
+    const FILE_ATTRIBUTE_UNPINNED: u32 = 0x00100000;
+    let attrs = metadata.file_attributes();
+    (attrs
+        & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+            | FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | FILE_ATTRIBUTE_PINNED
+            | FILE_ATTRIBUTE_UNPINNED))
+        != 0
+}
+
+/// Query the Windows Cloud Files API (Shell PropertyStore) for the cloud
+/// provider id and high-level sync state of `path`.
+///
+/// Returns `(None, None)` for items that are not part of any cloud namespace.
+/// Errors from missing properties are swallowed — they just indicate a
+/// non-cloud item, which is the common case.
+#[cfg(target_os = "windows")]
+fn get_cloud_status(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> (Option<String>, Option<CloudSyncState>) {
+    // Fast path: if the path doesn't look like a known cloud root AND has no
+    // recall/pin attributes, skip the COM call. This matters for large local
+    // directory listings.
+    if !looks_like_cloud_root(path) && !metadata_has_cloud_attrs(metadata) {
+        return (None, None);
+    }
+
+    use windows::core::{GUID, PCWSTR};
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
+    use windows::Win32::UI::Shell::{IShellItem2, SHCreateItemFromParsingName};
+
+    // PKEY definitions from propkey.h.
+    // PKEY_FilePlaceholderStatus  {B2F9B9D6-FEC4-4DD5-94D7-8957488C807B}, 2  (UInt32)
+    // PKEY_StorageProviderId      {FCEFF153-E839-4CF3-A9E7-EA22832094B8}, 108 (String)
+    // PKEY_StorageProviderState   {E77E90DF-6271-4F5B-834F-2DD1F245DDA4}, 3  (UInt32)
+    const PKEY_FILE_PLACEHOLDER_STATUS: PROPERTYKEY = PROPERTYKEY {
+        fmtid: GUID::from_u128(0xB2F9B9D6_FEC4_4DD5_94D7_8957488C807B),
+        pid: 2,
+    };
+    const PKEY_STORAGE_PROVIDER_ID: PROPERTYKEY = PROPERTYKEY {
+        fmtid: GUID::from_u128(0xFCEFF153_E839_4CF3_A9E7_EA22832094B8),
+        pid: 108,
+    };
+    const PKEY_STORAGE_PROVIDER_STATE: PROPERTYKEY = PROPERTYKEY {
+        fmtid: GUID::from_u128(0xE77E90DF_6271_4F5B_834F_2DD1F245DDA4),
+        pid: 3,
+    };
+
+    // PLACEHOLDER_STATES bits (from windows::Win32::UI::Shell::PropertiesSystem):
+    //  PS_MARKED_FOR_OFFLINE_AVAILABILITY = 1
+    //  PS_FULL_PRIMARY_STREAM_AVAILABLE   = 2
+    //  PS_CREATE_FILE_ACCESSIBLE          = 4
+    //  PS_CLOUDFILE_PLACEHOLDER           = 8
+    const PS_FULL_PRIMARY_STREAM_AVAILABLE: u32 = 2;
+    const PS_CLOUDFILE_PLACEHOLDER: u32 = 8;
+
+    // STORAGEPROVIDERSTATE values
+    const STORAGEPROVIDERSTATE_IN_SYNC: u32 = 2;
+    const STORAGEPROVIDERSTATE_PINNED: u32 = 3;
+    const STORAGEPROVIDERSTATE_PENDING_UPLOAD: u32 = 4;
+    const STORAGEPROVIDERSTATE_PENDING_DOWNLOAD: u32 = 5;
+    const STORAGEPROVIDERSTATE_TRANSFERRING: u32 = 6;
+    const STORAGEPROVIDERSTATE_ERROR: u32 = 7;
+
+    unsafe {
+        // Existing commands rely on this being initialized; calling again is safe
+        // (it returns S_FALSE/RPC_E_CHANGED_MODE — both ignored here).
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let item: IShellItem2 =
+            match SHCreateItemFromParsingName(PCWSTR::from_raw(wide.as_ptr()), None) {
+                Ok(it) => it,
+                Err(_) => return (None, None),
+            };
+
+        // Provider id (string). Absence is normal for local files.
+        let provider = match item.GetString(&PKEY_STORAGE_PROVIDER_ID) {
+            Ok(pwstr) if !pwstr.is_null() => {
+                let s = pwstr.to_string().ok();
+                // SHStrDupW-allocated; release with CoTaskMemFree.
+                windows::Win32::System::Com::CoTaskMemFree(Some(pwstr.as_ptr() as *const _));
+                s
+            }
+            _ => None,
+        };
+
+        // Prefer FilePlaceholderStatus (most precise), fall back to StorageProviderState.
+        let state = match item.GetUInt32(&PKEY_FILE_PLACEHOLDER_STATUS) {
+            Ok(bits) => {
+                if bits & PS_FULL_PRIMARY_STREAM_AVAILABLE != 0 {
+                    Some(CloudSyncState::Synced)
+                } else if bits & PS_CLOUDFILE_PLACEHOLDER != 0 {
+                    Some(CloudSyncState::OnlineOnly)
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        };
+
+        let state = match state {
+            Some(s) => Some(s),
+            None => match item.GetUInt32(&PKEY_STORAGE_PROVIDER_STATE) {
+                Ok(v) => match v {
+                    STORAGEPROVIDERSTATE_IN_SYNC | STORAGEPROVIDERSTATE_PINNED => {
+                        Some(CloudSyncState::Synced)
+                    }
+                    STORAGEPROVIDERSTATE_PENDING_UPLOAD
+                    | STORAGEPROVIDERSTATE_PENDING_DOWNLOAD
+                    | STORAGEPROVIDERSTATE_TRANSFERRING => Some(CloudSyncState::Syncing),
+                    STORAGEPROVIDERSTATE_ERROR => Some(CloudSyncState::Error),
+                    _ => None,
+                },
+                Err(_) => None,
+            },
+        };
+
+        // If we still have no state but file attributes say it's a recall placeholder,
+        // we know enough to mark it OnlineOnly even without a provider id.
+        let state = state.or_else(|| {
+            if metadata_has_cloud_attrs(metadata) {
+                Some(CloudSyncState::OnlineOnly)
+            } else {
+                None
+            }
+        });
+
+        (provider, state)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_cloud_status(
+    _path: &Path,
+    _metadata: &std::fs::Metadata,
+) -> (Option<String>, Option<CloudSyncState>) {
+    (None, None)
+}
+
+/// Helper to keep `is_cloud_placeholder` consistent with `sync_state` once we have it.
+fn cloud_placeholder_flag(legacy: bool, state: &Option<CloudSyncState>) -> bool {
+    match state {
+        Some(CloudSyncState::OnlineOnly) => true,
+        Some(_) => false,
+        None => legacy,
+    }
+}
+
 /// Read the contents of a directory
 #[tauri::command]
 fn read_directory(path: String) -> Result<Vec<FileEntry>, String> {
@@ -65,13 +281,8 @@ fn read_directory(path: String) -> Result<Vec<FileEntry>, String> {
     for entry in read_result {
         if let Ok(entry) = entry {
             if let Ok(metadata) = entry.metadata() {
-                let modified = metadata
-                    .modified()
-                    .map(|time| {
-                        let datetime: DateTime<Local> = time.into();
-                        datetime.format("%Y-%m-%d %H:%M").to_string()
-                    })
-                    .unwrap_or_else(|_| String::from("-"));
+                let modified = format_system_time(metadata.modified());
+                let created = format_system_time(metadata.created());
 
                 let extension = entry
                     .path()
@@ -79,14 +290,19 @@ fn read_directory(path: String) -> Result<Vec<FileEntry>, String> {
                     .map(|e| e.to_string_lossy().to_lowercase())
                     .unwrap_or_default();
 
+                let legacy_placeholder = is_cloud_placeholder(&metadata);
+                let (cloud_provider, sync_state) = get_cloud_status(&entry.path(), &metadata);
                 entries.push(FileEntry {
                     name: entry.file_name().to_string_lossy().to_string(),
                     path: entry.path().to_string_lossy().to_string(),
                     is_dir: metadata.is_dir(),
                     size: metadata.len(),
                     modified,
+                    created,
                     extension,
-                    is_cloud_placeholder: is_cloud_placeholder(&metadata),
+                    is_cloud_placeholder: cloud_placeholder_flag(legacy_placeholder, &sync_state),
+                    cloud_provider,
+                    sync_state,
                 });
             }
         }
@@ -155,13 +371,8 @@ fn search_files(
 
         if file_name.contains(&query_lower) {
             if let Ok(metadata) = entry.metadata() {
-                let modified = metadata
-                    .modified()
-                    .map(|time| {
-                        let datetime: DateTime<Local> = time.into();
-                        datetime.format("%Y-%m-%d %H:%M").to_string()
-                    })
-                    .unwrap_or_else(|_| String::from("-"));
+                let modified = format_system_time(metadata.modified());
+                let created = format_system_time(metadata.created());
 
                 let extension = entry
                     .path()
@@ -169,14 +380,19 @@ fn search_files(
                     .map(|e| e.to_string_lossy().to_lowercase())
                     .unwrap_or_default();
 
+                let legacy_placeholder = is_cloud_placeholder(&metadata);
+                let (cloud_provider, sync_state) = get_cloud_status(entry.path(), &metadata);
                 results.push(FileEntry {
                     name: entry.file_name().to_string_lossy().to_string(),
                     path: entry.path().to_string_lossy().to_string(),
                     is_dir: metadata.is_dir(),
                     size: metadata.len(),
                     modified,
+                    created,
                     extension,
-                    is_cloud_placeholder: is_cloud_placeholder(&metadata),
+                    is_cloud_placeholder: cloud_placeholder_flag(legacy_placeholder, &sync_state),
+                    cloud_provider,
+                    sync_state,
                 });
             }
         }
@@ -226,8 +442,11 @@ fn get_quick_access() -> Vec<FileEntry> {
                     is_dir: true,
                     size: 0,
                     modified: String::new(),
+                    created: String::new(),
                     extension: String::new(),
                     is_cloud_placeholder: false, // Local folders are never cloud placeholders
+                    cloud_provider: None,
+                    sync_state: None,
                 });
             }
         }
@@ -349,14 +568,23 @@ fn get_folder_children(path: String) -> Result<Vec<FileEntry>, String> {
                 let name = entry.file_name().to_string_lossy().to_string();
                 // Skip hidden and system folders
                 if !name.starts_with('.') && !name.starts_with('$') {
+                    let legacy_placeholder = is_cloud_placeholder(&metadata);
+                    let (cloud_provider, sync_state) =
+                        get_cloud_status(&entry.path(), &metadata);
                     folders.push(FileEntry {
                         name,
                         path: entry.path().to_string_lossy().to_string(),
                         is_dir: true,
                         size: 0,
                         modified: String::new(),
+                        created: String::new(),
                         extension: String::new(),
-                        is_cloud_placeholder: is_cloud_placeholder(&metadata),
+                        is_cloud_placeholder: cloud_placeholder_flag(
+                            legacy_placeholder,
+                            &sync_state,
+                        ),
+                        cloud_provider,
+                        sync_state,
                     });
                 }
             }
