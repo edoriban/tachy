@@ -1,4 +1,4 @@
-# 📁 EdoriFile Explorer
+# 📁 Tachy
 
 A modern, fast, and beautiful file explorer for Windows 11, built with **Rust** (Tauri) and **React**.
 
@@ -30,8 +30,8 @@ A modern, fast, and beautiful file explorer for Windows 11, built with **Rust** 
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/edorifile-explorer.git
-cd edorifile-explorer
+git clone https://github.com/yourusername/tachy.git
+cd tachy
 ```
 
 2. Install dependencies:
@@ -52,7 +52,7 @@ pnpm tauri build
 ## 🏗️ Project Structure
 
 ```
-edorifile-explorer/
+tachy/
 ├── src/                    # React frontend
 │   ├── components/         # UI components
 │   │   ├── Sidebar.tsx     # Navigation sidebar

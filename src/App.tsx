@@ -1,4 +1,4 @@
-// EdoriFile Explorer - Main Application
+// Tachy - Main Application
 // Refactored with SOLID principles using Zustand for state management
 
 import { useState, useEffect } from 'react';

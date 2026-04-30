@@ -888,7 +888,7 @@ fn generate_shell_thumbnail(path: &str, size: u32) -> Result<String, String> {
         // Convert HBITMAP to PNG
         let hdc = CreateCompatibleDC(None);
         if hdc.is_invalid() {
-            DeleteObject(hbitmap);
+            let _ = DeleteObject(hbitmap);
             CoUninitialize();
             return Err("Failed to create DC".to_string());
         }
@@ -928,8 +928,8 @@ fn generate_shell_thumbnail(path: &str, size: u32) -> Result<String, String> {
 
         // Cleanup GDI objects
         SelectObject(hdc, old_bitmap);
-        DeleteDC(hdc);
-        DeleteObject(hbitmap);
+        let _ = DeleteDC(hdc);
+        let _ = DeleteObject(hbitmap);
         CoUninitialize();
 
         if result == 0 {
@@ -1076,7 +1076,7 @@ fn main() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             // Create tray menu
-            let show_item = MenuItemBuilder::with_id("show", "Show EdoriFile")
+            let show_item = MenuItemBuilder::with_id("show", "Show Tachy")
                 .build(app)
                 .expect("failed to build show menu item");
             let quit_item = MenuItemBuilder::with_id("quit", "Exit")
@@ -1093,7 +1093,7 @@ fn main() {
             // Create tray icon
             let _tray = TrayIconBuilder::new()
                 .menu(&tray_menu)
-                .tooltip("EdoriFile Explorer")
+                .tooltip("Tachy")
                 .icon(app.default_window_icon().unwrap().clone())
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => {

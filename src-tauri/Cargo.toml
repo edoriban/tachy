@@ -1,5 +1,5 @@
 [package]
-name = "edorifile-explorer"
+name = "tachy"
 version = "0.1.0"
 description = "A modern file explorer for Windows 11"
 authors = ["Edgar"]
