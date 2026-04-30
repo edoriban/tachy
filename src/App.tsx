@@ -190,7 +190,7 @@ function App() {
 
         {/* Main content */}
         <main
-          className="flex-1 flex flex-col overflow-hidden file-area"
+          className="relative flex-1 flex flex-col overflow-hidden file-area"
           onContextMenu={handleBackgroundContextMenu}
         >
           {/* Search indicator */}
@@ -213,22 +213,29 @@ function App() {
             </div>
           )}
 
-          {/* Loading */}
+          {/* Top progress bar while loading — overlays content WITHOUT hiding it.
+              Stale entries from the previous folder remain visible until the new
+              fetch resolves, eliminating the blank-flash between folders. */}
           {currentState.isLoading && (
-            <div className="absolute inset-0 flex items-center justify-center bg-[var(--color-bg-surface)]/80 z-10">
-              <div className="flex items-center gap-2 text-[var(--color-text-secondary)]">
-                <div className="w-4 h-4 border-2 border-[var(--color-accent)] border-t-transparent rounded-full animate-spin" />
-                Loading...
-              </div>
+            <div
+              className="pointer-events-none absolute top-0 left-0 right-0 h-[2px] z-10 overflow-hidden"
+              aria-hidden="true"
+            >
+              <div className="h-full w-1/3 bg-[var(--color-accent)] tachy-loading-bar" />
             </div>
           )}
 
-          {/* Files (or virtual Home aggregator) */}
+          {/* Files (or virtual Home aggregator).
+              While loading with no stale data (genuine first-time load on this tab),
+              suppress the "empty folder" placeholder — the top progress bar alone
+              communicates the in-flight fetch. */}
           {currentState.path === HOME_PATH ? (
             <HomeView
               onOpen={handleOpen}
               onContextMenu={handleContextMenu}
             />
+          ) : currentState.isLoading && currentFiles.length === 0 ? (
+            <div className="flex-1" />
           ) : viewMode === 'grid' ? (
             <FileGrid
               files={currentFiles}
