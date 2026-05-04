@@ -1,0 +1,86 @@
+# Release pipeline for Tachy
+#
+# How to trigger:
+#   Push a tag matching `v*` (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
+#
+# What this workflow does:
+#   - Builds the Tauri app on `windows-latest` (Tachy is Windows-only: Mica,
+#     Cloud Files API, IContextMenu — it will not run on macOS/Linux).
+#   - Produces both bundle targets configured in `src-tauri/tauri.conf.json`:
+#       * MSI installer  -> src-tauri/target/release/bundle/msi/*.msi
+#       * NSIS installer -> src-tauri/target/release/bundle/nsis/*.exe
+#   - Creates a GitHub Release as a DRAFT and uploads both installers as
+#     release assets. Review the draft, edit the notes, then publish manually.
+#
+# Future improvements (not configured here):
+#   - Code signing (Authenticode certificate via `WINDOWS_CERTIFICATE` /
+#     `WINDOWS_CERTIFICATE_PASSWORD` secrets and tauri.conf.json `windows`
+#     fields).
+#   - Auto-updater endpoint with signed update artifacts.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "pnpm"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri app and create draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Tachy v__VERSION__"
+          releaseBody: |
+            ## Tachy v__VERSION__
+
+            Modern, fast file explorer for Windows 11.
+
+            ### Downloads
+            - **`.msi`** — Windows Installer package. Recommended for
+              enterprise / managed environments and `winget` packaging.
+            - **`.exe`** (NSIS) — Lightweight installer with a friendlier
+              first-run experience. Recommended for most users.
+
+            See the [README](https://github.com/edoriban/tachy#-download)
+            for installation help.
+
+            ---
+            _This release was built automatically by GitHub Actions._
+          releaseDraft: true
+          prerelease: false
