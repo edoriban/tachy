@@ -2167,6 +2167,14 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // Updater + process plugins. Updater checks GitHub Releases for a
+        // newer signed `latest.json` on demand from the frontend; process
+        // exposes `relaunch()` so the frontend can restart the app after the
+        // installer finishes. Both are desktop-only by design and safe to
+        // register here (single-instance must remain first; everything else
+        // is order-independent).
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // Create tray menu
             let show_item = MenuItemBuilder::with_id("show", "Show Tachy")

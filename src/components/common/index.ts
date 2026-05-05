@@ -2,3 +2,4 @@
 export { InputDialog, ConfirmDialog } from './Dialog';
 export { WindowControls } from './WindowControls';
 export { PropertiesDialog } from './PropertiesDialog';
+export { UpdateBanner } from './UpdateBanner';

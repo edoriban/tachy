@@ -5,6 +5,7 @@
 export { InputDialog, ConfirmDialog } from './common/Dialog';
 export { WindowControls } from './common/WindowControls';
 export { PropertiesDialog } from './common/PropertiesDialog';
+export { UpdateBanner } from './common/UpdateBanner';
 
 // Layout components
 export { TabBar } from './layout/TabBar';

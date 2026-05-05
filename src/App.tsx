@@ -28,7 +28,8 @@ import {
   PreviewPanel,
   InputDialog,
   ConfirmDialog,
-  PropertiesDialog
+  PropertiesDialog,
+  UpdateBanner
 } from '@components';
 
 function App() {
@@ -189,6 +190,10 @@ function App() {
         onTabClose={closeTab}
         onNewTab={() => addTab(currentState.path)}
       />
+
+      {/* Update banner — only renders when a newer release is available.
+          Hooks into tauri-plugin-updater on mount; silent on failure. */}
+      <UpdateBanner />
 
       {/* Toolbar */}
       <Toolbar

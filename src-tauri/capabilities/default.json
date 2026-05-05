@@ -18,6 +18,9 @@
     },
     "shell:allow-open",
     "shell:default",
-    "clipboard-manager:default"
+    "clipboard-manager:default",
+    "updater:default",
+    "process:default",
+    "process:allow-restart"
   ]
 }

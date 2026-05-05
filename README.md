@@ -55,6 +55,14 @@ Both installers ship the same app — pick whichever fits your environment.
 
 > Tachy is currently unsigned. Windows SmartScreen may show a warning the first time you run it; click **More info → Run anyway** to continue. Code signing is on the roadmap.
 
+## 🔄 Auto-update
+
+Starting with **v0.1.3**, Tachy checks GitHub Releases on launch for a newer version. When one is available a discreet banner appears at the top of the window with **Install & restart** and **Later** buttons. Choosing install downloads the new bundle, verifies its cryptographic signature against an embedded public key, applies the update, and relaunches the app.
+
+- **Signed.** Every update artifact is signed with a private key held by the maintainer; tampered or unsigned bundles are rejected by the client.
+- **No telemetry.** The only outbound request is a single GET to `https://github.com/edoriban/tachy/releases/latest/download/latest.json` on launch. No analytics, no identifiers, no phoning home beyond that version manifest.
+- **Opt-out by ignoring it.** Hit **Later** and the banner stays hidden for the rest of the session — there is no scheduled retry, popup, or background download.
+
 ## 🛠️ Technology Stack
 
 | Layer                   | Technology                                                          |
@@ -171,7 +179,7 @@ The workflow runs on `windows-latest`, builds both bundle targets, and creates a
 - [ ] Custom themes
 - [ ] Keyboard shortcuts overlay
 - [ ] Code signing for installers (no SmartScreen warning)
-- [ ] Auto-updater
+- [x] Auto-updater (v0.1.3+)
 - [ ] Localization
 
 ## 🤝 Contributing

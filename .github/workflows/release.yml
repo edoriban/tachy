@@ -12,11 +12,24 @@
 #   - Creates a GitHub Release as a DRAFT and uploads both installers as
 #     release assets. Review the draft, edit the notes, then publish manually.
 #
+# Auto-updater:
+#   The app uses `tauri-plugin-updater` to check
+#   `https://github.com/edoriban/tachy/releases/latest/download/latest.json`
+#   on launch. For the workflow to produce a valid `latest.json` (which is
+#   required for the updater to accept the new version), TWO repository
+#   secrets MUST be configured BEFORE pushing a tag:
+#     * TAURI_SIGNING_PRIVATE_KEY          — the contents of `~/.tauri/tachy.key`
+#       generated locally with `pnpm tauri signer generate -w ~/.tauri/tachy.key`.
+#     * TAURI_SIGNING_PRIVATE_KEY_PASSWORD — the password chosen at key generation.
+#   With both secrets set AND `plugins.updater.pubkey` populated in
+#   `src-tauri/tauri.conf.json`, `tauri-action` automatically signs each
+#   bundle, generates `latest.json`, and uploads it as a release asset
+#   alongside the .msi/.exe — no extra flags required.
+#
 # Future improvements (not configured here):
 #   - Code signing (Authenticode certificate via `WINDOWS_CERTIFICATE` /
 #     `WINDOWS_CERTIFICATE_PASSWORD` secrets and tauri.conf.json `windows`
 #     fields).
-#   - Auto-updater endpoint with signed update artifacts.
 
 name: Release
 
@@ -63,6 +76,11 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing — see header comment. If these are unset, the
+          # bundle still builds but `latest.json` will not be generated and
+          # installed clients will silently skip the update check.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Tachy v__VERSION__"

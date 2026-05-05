@@ -4,3 +4,4 @@ export { useKeyboardShortcuts } from './useKeyboardShortcuts';
 export { useKeyboardNavigation } from './useKeyboardNavigation';
 export { useContextMenu } from './useContextMenu';
 export { useThumbnail, isThumbnailSupported } from './useThumbnail';
+export { useAppUpdate, type UseAppUpdateResult } from './useAppUpdate';
