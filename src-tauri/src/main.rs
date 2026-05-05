@@ -1623,6 +1623,25 @@ async fn show_context_menu(
         );
     }
 
+    // Hybrid menu: append "Copy as path" + "Show more options" when the
+    // user right-clicked on an actual item. Background right-click on the
+    // empty file list area still gets the basic menu only.
+    if file_path.is_some() {
+        menu_builder = menu_builder
+            .separator()
+            .item(
+                &MenuItemBuilder::with_id("copy_as_path", "Copy as path")
+                    .build(&app)
+                    .map_err(|e| e.to_string())?,
+            )
+            .separator()
+            .item(
+                &MenuItemBuilder::with_id("show_more_options", "Show more options")
+                    .build(&app)
+                    .map_err(|e| e.to_string())?,
+            );
+    }
+
     let menu = menu_builder.build().map_err(|e| e.to_string())?;
 
     // Show menu at cursor position using popup
@@ -1630,6 +1649,244 @@ async fn show_context_menu(
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+// Show the legacy Win32 shell context menu (the same one Windows shows on
+// Shift+Right-click) at the given screen coordinates. This brings in all
+// installed shell extensions (OneDrive submenu, 7-Zip "Compress to…", Git
+// Bash "Open in Git Bash", "Send to", "Open with", etc.) without us
+// implementing any of them. We're NOT replicating the Win11 modern menu —
+// the legacy one (IContextMenu) is sufficient.
+//
+// COM init + shell APIs require STA. Tauri command handlers run on tokio
+// workers (MTA), so we dispatch the work onto the main UI thread via
+// app_handle.run_on_main_thread, mirroring share_file_native.
+//
+// `paths`: absolute filesystem paths of the right-clicked item(s). When
+//          multiple are given, the menu operates on the whole selection.
+// `x`, `y`: screen coordinates where the menu should appear (typically the
+//           cursor position at right-click time, captured from event.screenX/Y).
+#[tauri::command]
+fn show_shell_context_menu(
+    app_handle: tauri::AppHandle,
+    window: tauri::Window,
+    paths: Vec<String>,
+    x: i32,
+    y: i32,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        if paths.is_empty() {
+            return Err("No paths provided".to_string());
+        }
+
+        let hwnd_raw: isize = match window.hwnd() {
+            Ok(h) => h.0 as isize,
+            Err(e) => return Err(format!("Failed to get HWND: {}", e)),
+        };
+
+        println!(
+            "[ShellMenu] Showing IContextMenu for {} item(s) at ({}, {})",
+            paths.len(),
+            x,
+            y
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let paths_for_main = paths.clone();
+        let dispatch_result = app_handle.run_on_main_thread(move || {
+            let result = shell_menu_impl::show_shell_menu(hwnd_raw, paths_for_main, x, y);
+            let _ = tx.send(result);
+        });
+
+        if let Err(e) = dispatch_result {
+            return Err(format!("Failed to dispatch to main thread: {}", e));
+        }
+
+        // TrackPopupMenuEx blocks until the user dismisses or selects, and
+        // InvokeCommand can also spawn modal UI (e.g. "Send to ..." submenu
+        // → file dialog). The recv just waits for whatever happens.
+        match rx.recv() {
+            Ok(r) => r,
+            Err(e) => Err(format!("Main-thread channel closed unexpectedly: {}", e)),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app_handle, window, paths, x, y);
+        Err("Shell context menu is only supported on Windows".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod shell_menu_impl {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::core::{PCSTR, PCWSTR};
+    use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{
+        IContextMenu, SHCreateShellItemArrayFromIDLists, SHParseDisplayName, BHID_SFUIObject,
+        CMINVOKECOMMANDINFO, CMF_EXTENDEDVERBS, CMF_NORMAL,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreatePopupMenu, DestroyMenu, TrackPopupMenuEx, HMENU, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    };
+
+    /// HRESULT_FROM_WIN32(ERROR_CANCELLED). InvokeCommand returns this when
+    /// the user cancels a modal launched by a verb (e.g. dismisses an "Open
+    /// with" picker). Treat as success — the user simply backed out.
+    const ERROR_CANCELLED_HRESULT: i32 = 0x800704C7u32 as i32;
+
+    pub fn show_shell_menu(
+        hwnd_raw: isize,
+        paths: Vec<String>,
+        x: i32,
+        y: i32,
+    ) -> Result<(), String> {
+        let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
+
+        // Defensive: ensure STA. Idempotent on the main UI thread.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+
+        // 1. Build PIDLs for each path.
+        let mut pidls: Vec<*mut ITEMIDLIST> = Vec::with_capacity(paths.len());
+        let cleanup_pidls = |pidls: &mut Vec<*mut ITEMIDLIST>| unsafe {
+            for p in pidls.drain(..) {
+                if !p.is_null() {
+                    CoTaskMemFree(Some(p as *const _));
+                }
+            }
+        };
+
+        for path in &paths {
+            let wide: Vec<u16> = std::ffi::OsStr::new(path)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+            let parse_result = unsafe {
+                SHParseDisplayName(
+                    PCWSTR::from_raw(wide.as_ptr()),
+                    None,
+                    &mut pidl,
+                    0,
+                    None,
+                )
+            };
+            if parse_result.is_err() || pidl.is_null() {
+                let mut owned = pidls;
+                cleanup_pidls(&mut owned);
+                return Err(format!(
+                    "SHParseDisplayName failed for {}: {:?}",
+                    path, parse_result
+                ));
+            }
+            pidls.push(pidl);
+        }
+
+        // 2. IShellItemArray from PIDLs.
+        // SHCreateShellItemArrayFromIDLists takes &[*const ITEMIDLIST].
+        let pidls_const: Vec<*const ITEMIDLIST> =
+            pidls.iter().map(|p| *p as *const ITEMIDLIST).collect();
+        let array = match unsafe { SHCreateShellItemArrayFromIDLists(&pidls_const) } {
+            Ok(a) => a,
+            Err(e) => {
+                cleanup_pidls(&mut pidls);
+                return Err(format!("SHCreateShellItemArrayFromIDLists failed: {}", e));
+            }
+        };
+
+        // 3. Bind IContextMenu via BHID_SFUIObject.
+        let context_menu: IContextMenu = match unsafe {
+            array.BindToHandler::<Option<&windows::Win32::System::Com::IBindCtx>, IContextMenu>(
+                None,
+                &BHID_SFUIObject,
+            )
+        } {
+            Ok(cm) => cm,
+            Err(e) => {
+                cleanup_pidls(&mut pidls);
+                return Err(format!("BindToHandler(IContextMenu) failed: {}", e));
+            }
+        };
+
+        // 4. Populate HMENU with the shell extension entries.
+        let hmenu: HMENU = match unsafe { CreatePopupMenu() } {
+            Ok(h) => h,
+            Err(e) => {
+                cleanup_pidls(&mut pidls);
+                return Err(format!("CreatePopupMenu failed: {}", e));
+            }
+        };
+
+        const ID_CMD_FIRST: u32 = 1;
+        const ID_CMD_LAST: u32 = 0x7FFF;
+
+        // CMF_EXTENDEDVERBS is the "Shift held" flag — surfaces hidden items
+        // that the shell normally only shows on Shift+Right-click.
+        let qcm_flags = CMF_NORMAL | CMF_EXTENDEDVERBS;
+        if let Err(e) = unsafe {
+            context_menu.QueryContextMenu(hmenu, 0, ID_CMD_FIRST, ID_CMD_LAST, qcm_flags)
+        } {
+            unsafe {
+                let _ = DestroyMenu(hmenu);
+            }
+            cleanup_pidls(&mut pidls);
+            return Err(format!("QueryContextMenu failed: {}", e));
+        }
+
+        // 5. TrackPopupMenuEx — blocks until user picks or cancels.
+        // TPM_RETURNCMD: return the picked command id instead of posting WM_COMMAND.
+        let cmd = unsafe {
+            TrackPopupMenuEx(
+                hmenu,
+                (TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
+                x,
+                y,
+                hwnd,
+                None,
+            )
+        };
+
+        if cmd.0 == 0 {
+            // User cancelled (clicked outside or Esc). Not an error.
+            unsafe {
+                let _ = DestroyMenu(hmenu);
+            }
+            cleanup_pidls(&mut pidls);
+            return Ok(());
+        }
+
+        // 6. InvokeCommand — relative ID is (cmd - ID_CMD_FIRST). MAKEINTRESOURCEA
+        // packs that integer into the lpVerb pointer (high WORD must be zero).
+        let relative_id = (cmd.0 as u32).saturating_sub(ID_CMD_FIRST);
+        let mut info = CMINVOKECOMMANDINFO::default();
+        info.cbSize = std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32;
+        info.hwnd = hwnd;
+        info.lpVerb = PCSTR(relative_id as usize as *const u8);
+        info.nShow = 1; // SW_SHOWNORMAL
+
+        let invoke_point = POINT { x, y };
+        let _ = invoke_point; // reserved for CMINVOKECOMMANDINFOEX upgrade if needed
+
+        let invoke_result = unsafe { context_menu.InvokeCommand(&info) };
+
+        // 7. Cleanup regardless of invoke outcome.
+        unsafe {
+            let _ = DestroyMenu(hmenu);
+        }
+        cleanup_pidls(&mut pidls);
+
+        match invoke_result {
+            Ok(()) => Ok(()),
+            Err(e) if e.code().0 == ERROR_CANCELLED_HRESULT => Ok(()),
+            Err(e) => Err(format!("InvokeCommand failed: {}", e)),
+        }
+    }
 }
 
 /// Supported extensions for thumbnail generation - images (fast, use image crate)
@@ -1640,7 +1897,7 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 /// Extensions that Windows Shell can generate thumbnails for (videos, PDFs, etc)
 const SHELL_THUMBNAIL_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpeg", "mpg", "pdf", "doc", "docx",
-    "xls", "xlsx", "ppt", "pptx",
+    "xls", "xlsx", "ppt", "pptx", "exe", "lnk", "url",
 ];
 
 /// Check if file supports thumbnail via image crate
@@ -1669,7 +1926,7 @@ fn generate_shell_thumbnail(path: &str, size: u32) -> Result<String, String> {
     };
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::Shell::{
-        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_THUMBNAILONLY,
+        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF,
     };
 
     unsafe {
@@ -1691,7 +1948,7 @@ fn generate_shell_thumbnail(path: &str, size: u32) -> Result<String, String> {
         };
 
         let hbitmap = shell_item
-            .GetImage(thumb_size, SIIGBF_THUMBNAILONLY)
+            .GetImage(thumb_size, SIIGBF(0))
             .map_err(|e| format!("Failed to get thumbnail: {:?}", e))?;
 
         // Convert HBITMAP to PNG
@@ -1874,12 +2131,39 @@ fn read_file_preview(path: String, max_lines: Option<usize>) -> Result<FilePrevi
     })
 }
 
+// Payload forwarded to the running instance when a second `tachy.exe` is
+// launched. The frontend listens for the `single-instance` event and turns
+// `argv[1..]` into a new tab in the existing window.
+#[derive(Clone, serde::Serialize)]
+struct SingleInstancePayload {
+    argv: Vec<String>,
+    cwd: String,
+}
+
 fn main() {
     use tauri::menu::{MenuBuilder, MenuItemBuilder};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
     use tauri::{Emitter, Manager, WindowEvent};
 
     tauri::Builder::default()
+        // IMPORTANT: single-instance MUST be the first plugin. The plugin's
+        // docs are explicit: registering it after others means a second
+        // instance will have already initialized those plugins (some of which
+        // grab global resources) before exiting, defeating the whole point.
+        // The callback runs in the EXISTING (primary) instance only.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            // Bring the main window forward.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            // Forward args to the frontend so it can open a new tab.
+            let _ = app.emit(
+                "single-instance",
+                SingleInstancePayload { argv, cwd },
+            );
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -1974,6 +2258,7 @@ fn main() {
             show_native_properties,
             share_file_native,
             show_context_menu,
+            show_shell_context_menu,
             get_thumbnail,
             read_file_preview
         ])

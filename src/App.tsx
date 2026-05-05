@@ -2,6 +2,7 @@
 // Refactored with SOLID principles using Zustand for state management
 
 import { useState, useEffect } from 'react';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import './App.css';
 
 // Stores
@@ -136,6 +137,42 @@ function App() {
       initializeFirstTab(HOME_PATH);
     };
     init();
+  }, []);
+
+  // Single-instance bridge: a second `tachy.exe` launch is intercepted by the
+  // tauri-plugin-single-instance Rust callback, which emits `single-instance`
+  // here with the new process's argv + cwd. We open the requested path as a
+  // new tab in this (existing) window so users get Explorer-style multi-tab
+  // behavior instead of multiple processes / tray icons.
+  //
+  // argv[0] is the exe path; meaningful args start at argv[1]. We pick the
+  // first non-flag positional arg as the target path. If absent, we fall back
+  // to HOME_PATH so the new tab is always non-empty.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+
+    listen<{ argv: string[]; cwd: string }>('single-instance', (event) => {
+      const { argv } = event.payload;
+      const pathArg = argv.slice(1).find((a) => !a.startsWith('-'));
+      const targetPath = pathArg && pathArg.length > 0 ? pathArg : HOME_PATH;
+      // Reuse the existing tab store action; identical to Ctrl+T behavior.
+      useTabStore.getState().addTab(targetPath);
+    }).then((fn) => {
+      // React 19 strict mode double-invokes effects in dev. If the cleanup
+      // already ran before listen() resolved, drop this stale subscription
+      // immediately rather than leaking a duplicate listener.
+      if (cancelled) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, []);
 
   // Get selected files from current files
