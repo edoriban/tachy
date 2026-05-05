@@ -1,6 +1,6 @@
 [package]
 name = "tachy"
-version = "0.1.1"
+version = "0.1.2"
 description = "A modern file explorer for Windows 11"
 authors = ["Edgar"]
 edition = "2021"

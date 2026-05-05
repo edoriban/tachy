@@ -28,7 +28,17 @@ A modern, fast, and beautiful file explorer for **Windows 11**, built with **Rus
 - **📤 Native Share** — Hands off to the Windows modern share sheet
 - **🏠 Home View** — Aggregated dashboard with Quick Access and recents
 - **⌨️ Keyboard Friendly** — Common shortcuts wired up out of the box
-- **🪶 Lightweight** — Small footprint thanks to Tauri (no Electron bloat!)
+
+## ⚖️ Honest Tradeoffs
+
+Tachy is built on Tauri + WebView2, not native Win32. That choice has real costs — here's the unvarnished version so you can decide if it fits your machine:
+
+- **Install size:** ~6 MB. WebView2 ships with Windows 11, so we don't bundle a browser. Electron-equivalent file managers tend to land at 150 MB+.
+- **Cold-start RAM (no other WebView2 apps running):** ~140 MB total — roughly 109 MB for the shared WebView2 Manager process, ~30 MB for the renderer, and ~10 MB for the Rust process.
+- **Marginal RAM (when Edge or other WebView2 apps are already running):** the Manager process is shared, so Tachy's added cost drops to ~30–40 MB.
+- **Native `explorer.exe` is still lighter** at ~105 MB resident — but that one process hosts the desktop, taskbar, Start menu, and every File Explorer window at once, so it's not a clean apples-to-apples comparison.
+
+We're not pretending to beat native. The pitch is a modern UI on top of comparable-or-slightly-higher overhead than the built-in shell, and a fraction of what an Electron equivalent would cost.
 
 ## 📥 Download
 
